@@ -1,7 +1,8 @@
 import { createContext, useContext, useEffect, useMemo, useState } from "react";
 import { motion } from "framer-motion";
-import { BrowserRouter, Link, NavLink, Navigate, Route, Routes, useNavigate } from "react-router-dom";
+import { BrowserRouter, Link, NavLink, Navigate, Route, Routes, useLocation, useNavigate } from "react-router-dom";
 import { computeWeightedScore, formatAnalysisDuration } from "./lib/scoring";
+import { generateClaimTestApi, submitClaimTestApi } from "./services/api";
 
 const fadeUp = {
   hidden: { opacity: 0, y: 30 },
@@ -9,9 +10,21 @@ const fadeUp = {
 };
 
 const metrics = [
-  { label: "Skill Detection Accuracy", value: "95%" },
-  { label: "Job Role Templates", value: "10+" },
-  { label: "Analysis Time", value: "Instant" },
+  {
+    title: "ATS Fit Score",
+    value: "Instant",
+    description: "Quick role readiness check",
+  },
+  {
+    title: "Skill Gap Finder",
+    value: "Matched vs Missing",
+    description: "See what to add next",
+  },
+  {
+    title: "Action Plan",
+    value: "Practical Suggestions",
+    description: "Direct improvement points",
+  },
 ];
 
 const ROLE_SKILL_MAP = {
@@ -128,7 +141,10 @@ const clearStoredAnalysisResult = () => {
     appState.clearAnalysisResult();
   } catch (_error) {
     // no-op
-  }
+  } 
+  
+  
+
 };
 
 const exportJsonFile = (fileName, payload) => {
@@ -251,15 +267,16 @@ function LandingPage() {
             <div id="highlights" className="mt-8 grid gap-4 md:grid-cols-3">
               {metrics.map((item) => (
                 <motion.div
-                  key={item.label}
+                  key={item.title}
                   initial="hidden"
                   whileInView="show"
                   viewport={{ once: true }}
                   variants={fadeUp}
                   className="rounded-2xl border border-slate-200 bg-white/85 p-6 text-center shadow-md backdrop-blur"
                 >
-                  <p className="text-3xl font-bold text-[var(--primary)]">{item.value}</p>
-                  <p className="mt-1 text-sm text-[var(--muted)]">{item.label}</p>
+                  <p className="text-xs font-semibold uppercase tracking-wide text-[var(--muted)]">{item.title}</p>
+                  <p className="mt-2 text-3xl font-bold text-[var(--primary)]">{item.value}</p>
+                  <p className="mt-2 text-sm text-[var(--muted)]">{item.description}</p>
                 </motion.div>
               ))}
             </div>
@@ -275,6 +292,66 @@ function LandingPage() {
 }
 
 function AnalyzePage() {
+  const COMPANY_SHORTLIST_TEMPLATES = [
+    { companyId: "code-orbit", companyName: "CodeOrbit", role: "Backend Developer", requiredSkills: ["Node", "Express", "MongoDB", "SQL", "System Design"] },
+    { companyId: "pixel-forge", companyName: "PixelForge", role: "Frontend Developer", requiredSkills: ["React", "JavaScript", "TypeScript", "CSS", "REST API"] },
+    { companyId: "data-sphere", companyName: "DataSphere", role: "Data Analyst", requiredSkills: ["Python", "SQL", "Statistics", "Excel"] },
+  ];
+  const normalizeSkill = (value) => String(value || "").toLowerCase().replace(/[^a-z0-9+#\s]/g, " ").replace(/\s+/g, " ").trim();
+  const buildTestBasedShortlist = ({ claimedSkills = [], skillBreakdown = [] }) => {
+    if (!Array.isArray(skillBreakdown) || skillBreakdown.length === 0) {
+      return [];
+    }
+    const claimSet = new Set((claimedSkills || []).map(normalizeSkill));
+    const scoreBySkill = Object.fromEntries(
+      (skillBreakdown || []).map((item) => [normalizeSkill(item.skill), Number(item.score || 0)])
+    );
+
+    return COMPANY_SHORTLIST_TEMPLATES.map((company) => {
+      const normalizedRequired = company.requiredSkills.map(normalizeSkill);
+      const matchedSkills = normalizedRequired.filter((skill) => claimSet.has(skill));
+      if (matchedSkills.length === 0) {
+        return null;
+      }
+      const testScore = Math.round(
+        matchedSkills.reduce((sum, skill) => sum + Number(scoreBySkill[skill] || 0), 0) / matchedSkills.length
+      );
+      const claimCoverage = Math.round((matchedSkills.length / normalizedRequired.length) * 100);
+      return {
+        companyId: company.companyId,
+        companyName: company.companyName,
+        role: company.role,
+        fitScore: testScore,
+        testScore,
+        claimCoverage,
+      };
+    }).filter(Boolean).sort((a, b) => b.fitScore - a.fitScore);
+  };
+  const normalizeClaimResult = (result, claimedSkills = []) => {
+    const shortlistFromResult = Array.isArray(result?.shortlist) ? result.shortlist : [];
+    const cleaned = shortlistFromResult
+      .filter((item) => Number(item?.claimCoverage || 0) > 0)
+      .map((item) => ({
+        ...item,
+        fitScore: Number.isFinite(Number(item?.testScore)) ? Math.round(Number(item.testScore)) : Math.round(Number(item?.fitScore || 0)),
+      }))
+      .sort((a, b) => b.fitScore - a.fitScore);
+    if (cleaned.length > 0) {
+      return {
+        ...result,
+        shortlist: cleaned,
+      };
+    }
+
+    return {
+      ...result,
+      shortlist: buildTestBasedShortlist({
+        claimedSkills,
+        skillBreakdown: Array.isArray(result?.skillBreakdown) ? result.skillBreakdown : [],
+      }),
+    };
+  };
+
   const [fileName, setFileName] = useState("");
   const [selectedFile, setSelectedFile] = useState(null);
   const [selectedDomain, setSelectedDomain] = useState(() => {
@@ -283,6 +360,12 @@ function AnalyzePage() {
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [analysisResult, setAnalysisResult] = useState(null);
   const [errorMessage, setErrorMessage] = useState("");
+  const [claimTest, setClaimTest] = useState(null);
+  const [claimAnswers, setClaimAnswers] = useState({});
+  const [claimResult, setClaimResult] = useState(null);
+  const [isGeneratingClaimTest, setIsGeneratingClaimTest] = useState(false);
+  const [isSubmittingClaimTest, setIsSubmittingClaimTest] = useState(false);
+  const [claimError, setClaimError] = useState("");
   const storedResult = getStoredAnalysisResult();
   const activeResult = analysisResult || storedResult;
   const hasAnalysis = Boolean(activeResult);
@@ -464,6 +547,144 @@ function AnalyzePage() {
     }
   };
 
+  const handleGenerateClaimTest = async () => {
+    if (!selectedFile) {
+      setClaimError("Upload a resume to generate the claim verification test.");
+      return;
+    }
+
+    setIsGeneratingClaimTest(true);
+    setClaimError("");
+    setClaimResult(null);
+
+    try {
+      const data = await generateClaimTestApi({ file: selectedFile });
+      setClaimTest(data);
+      setClaimAnswers({});
+    } catch (error) {
+      const fallbackSkills = (activeResult?.extractedSkills || []).slice(0, 5);
+      if (fallbackSkills.length > 0) {
+        const localQuestions = fallbackSkills.flatMap((skill, idx) => ([
+          {
+            id: `local_${idx}_1`,
+            skill,
+            type: "mcq",
+            prompt: `Which statement best reflects a practical use of ${skill}?`,
+            options: [
+              `Using ${skill} in production to solve problems with measurable impact`,
+              `${skill} is only theoretical and not used in real projects`,
+              `${skill} is not useful in team-based engineering work`,
+              `${skill} is unrelated to software or product delivery`,
+            ],
+            weight: 50,
+          },
+          {
+            id: `local_${idx}_2`,
+            skill,
+            type: "mcq",
+            prompt: `If ${skill} is listed in a resume, which signal shows strong proficiency?`,
+            options: [
+              "Can explain tradeoffs, debug issues, and deliver features independently",
+              "Has only heard the term and never used it in practice",
+              "Copies sample code without understanding implementation details",
+              `Avoids tasks related to ${skill}`,
+            ],
+            weight: 50,
+          },
+        ]));
+        setClaimTest({
+          testId: `practice_test_${Date.now()}`,
+          claimedSkills: fallbackSkills,
+          questions: localQuestions,
+          questionCount: localQuestions.length,
+        });
+        setClaimAnswers({});
+        setClaimError("");
+      } else {
+        setClaimError(error.message || "Claim test generation failed.");
+      }
+    } finally {
+      setIsGeneratingClaimTest(false);
+    }
+  };
+
+  const handleSelectAnswer = (questionId, selectedOption) => {
+    setClaimAnswers((prev) => ({
+      ...prev,
+      [questionId]: selectedOption,
+    }));
+  };
+
+  const handleSubmitClaimTest = async () => {
+    if (!claimTest?.testId) {
+      setClaimError("Generate the claim test before submitting.");
+      return;
+    }
+
+    const answers = (claimTest.questions || []).map((question) => ({
+      questionId: question.id,
+      selectedOption: Number.isInteger(claimAnswers[question.id]) ? claimAnswers[question.id] : -1,
+    }));
+
+    if (String(claimTest.testId).startsWith("practice_test_")) {
+      const grouped = (claimTest.questions || []).reduce((acc, question) => {
+        const selectedOption = claimAnswers[question.id];
+        const isAnswered = Number.isInteger(selectedOption) && selectedOption >= 0;
+        if (!isAnswered) {
+          return acc;
+        }
+        const key = question.skill;
+        if (!acc[key]) acc[key] = { correct: 0, total: 0 };
+        acc[key].total += 1;
+        if (selectedOption === 0) acc[key].correct += 1;
+        return acc;
+      }, {});
+
+      const skillBreakdown = Object.entries(grouped).map(([skill, value]) => ({
+        skill,
+        score: value.total ? Math.round((value.correct / value.total) * 100) : 0,
+      }));
+      const authenticityScore = skillBreakdown.length
+        ? Math.round(skillBreakdown.reduce((sum, item) => sum + item.score, 0) / skillBreakdown.length)
+        : 0;
+      const claimStatus = skillBreakdown.length === 0
+        ? "not_attempted"
+        : authenticityScore >= 75
+          ? "strongly_verified"
+          : authenticityScore >= 50
+            ? "partially_verified"
+            : "weakly_verified";
+
+      const shortlist = buildTestBasedShortlist({
+        claimedSkills: claimTest.claimedSkills || [],
+        skillBreakdown,
+      });
+
+      setClaimResult(normalizeClaimResult({
+        testId: claimTest.testId,
+        claimStatus,
+        authenticityScore,
+        skillBreakdown,
+        shortlist,
+      }, claimTest.claimedSkills || []));
+      return;
+    }
+
+    setIsSubmittingClaimTest(true);
+    setClaimError("");
+    try {
+      const data = await submitClaimTestApi({
+        testId: claimTest.testId,
+        answers,
+      });
+      setClaimResult(normalizeClaimResult(data, claimTest.claimedSkills || []));
+    } catch (error) {
+      setClaimError(error.message || "Claim test submission failed.");
+    } finally {
+      setIsSubmittingClaimTest(false);
+    }
+  };
+
   const analysisTimeLabel = useMemo(() => {
     if (!hasAnalysis) return "0s";
     try {
@@ -474,6 +695,22 @@ function AnalyzePage() {
     }
   }, [hasAnalysis, activeResult]);
   const analysisMeta = appState.getAnalysisMeta();
+  const claimQuestionGroups = useMemo(() => {
+    const map = new Map();
+    for (const question of claimTest?.questions || []) {
+      const key = question.skill || "General";
+      if (!map.has(key)) {
+        map.set(key, []);
+      }
+      map.get(key).push(question);
+    }
+    return Array.from(map.entries()).map(([skill, questions]) => ({ skill, questions }));
+  }, [claimTest]);
+  const claimStatusLabel = String(claimResult?.claimStatus || "")
+    .split("_")
+    .filter(Boolean)
+    .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+    .join(" ");
 
   return (
     <div className="analyze-bg min-h-screen">
@@ -481,6 +718,7 @@ function AnalyzePage() {
         <WorkspaceSidebar />
         <div className="px-8 py-8">
         <WorkspaceTopbar />
+        <PageExportActions className="mb-4" />
         <motion.h1
           initial={{ opacity: 0, y: 30 }}
           animate={{ opacity: 1, y: 0 }}
@@ -507,10 +745,10 @@ function AnalyzePage() {
           <div className="mb-3 flex items-center justify-between">
             <p className="text-sm font-semibold text-slate-800">Select Domain (Required)</p>
             <span className="rounded-full bg-teal-100 px-2.5 py-1 text-[11px] font-bold uppercase tracking-wide text-teal-700">
-              Step 1
+              
             </span>
           </div>
-          <p className="text-xs text-slate-600">Resume ko selected domain ke required skills ke against compare kiya jayega.</p>
+          <p className="text-xs text-slate-600">Select your domain</p>
           <div className="mt-3 grid gap-3 sm:grid-cols-3">
             {Object.keys(ROLE_SKILL_MAP).map((role) => (
               <button
@@ -664,6 +902,172 @@ function AnalyzePage() {
           )}
         </motion.div>
 
+        <motion.div
+          initial={{ opacity: 0, y: 30 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.6, delay: 0.3 }}
+          className="glass-panel mt-6 rounded-2xl p-6"
+        >
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <p className="text-base font-semibold text-slate-800">Resume  Verification Test</p>
+              <p className="mt-1 text-sm text-slate-600">
+                Questions are generated from resume skills and evaluated for company fit.
+              </p>
+            </div>
+            <button
+              onClick={handleGenerateClaimTest}
+              disabled={isGeneratingClaimTest || !selectedFile}
+              className="rounded-lg bg-[var(--primary)] px-4 py-2 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {isGeneratingClaimTest ? "Generating..." : "Generate Test"}
+            </button>
+          </div>
+
+          {claimError ? <p className="mt-3 text-sm font-medium text-red-600">{claimError}</p> : null}
+
+          {claimTest?.questions?.length ? (
+            <div className="mt-5">
+              <div className="rounded-xl border border-slate-200 bg-slate-50 p-3">
+                <p className="mt-1 text-xs text-slate-600">
+                  Claimed Skills: {(claimTest.claimedSkills || []).join(", ")}
+                </p>
+              </div>
+              <div className="mt-4 space-y-3">
+                {claimQuestionGroups.map((group) => (
+                  <div key={group.skill} className="rounded-xl border border-teal-100 bg-white p-4 shadow-sm">
+                    <div className="mb-3 flex items-center justify-between">
+                      <p className="text-xs font-semibold uppercase tracking-wide text-teal-700">{group.skill} Section</p>
+                      <span className="rounded-full bg-teal-50 px-2.5 py-1 text-[11px] font-semibold text-teal-700">
+                        {group.questions.length} Questions
+                      </span>
+                    </div>
+                    <div className="space-y-3">
+                      {group.questions.map((question, questionIndex) => (
+                        <div key={question.id} className="rounded-lg border border-slate-200 bg-slate-50 p-3">
+                          <p className="text-sm font-semibold text-slate-800">
+                            Q{questionIndex + 1}. {question.prompt}
+                          </p>
+                          <div className="mt-3 space-y-2">
+                            {(question.options || []).map((option, optionIndex) => (
+                              <label
+                                key={`${question.id}-${optionIndex}`}
+                                className={`flex cursor-pointer items-center gap-2 rounded-lg border px-3 py-2 text-sm ${
+                                  claimAnswers[question.id] === optionIndex
+                                    ? "border-teal-300 bg-teal-50"
+                                    : "border-slate-200 bg-white"
+                                }`}
+                              >
+                                <input
+                                  type="radio"
+                                  name={question.id}
+                                  checked={claimAnswers[question.id] === optionIndex}
+                                  onChange={() => handleSelectAnswer(question.id, optionIndex)}
+                                />
+                                <span>{option}</span>
+                              </label>
+                            ))}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+              <button
+                onClick={handleSubmitClaimTest}
+                disabled={isSubmittingClaimTest}
+                className="mt-4 rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-semibold text-slate-700 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {isSubmittingClaimTest ? "Submitting..." : "Submit Test & Generate Shortlist"}
+              </button>
+            </div>
+          ) : null}
+        </motion.div>
+
+        {claimResult ? (
+          <motion.div
+            initial={{ opacity: 0, y: 30 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.6, delay: 0.34 }}
+            className="glass-panel mt-6 rounded-2xl p-6"
+          >
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <p className="text-base font-semibold text-slate-800">Claim Verification Result</p>
+              <div className="flex items-center gap-2">
+                <span className="rounded-full bg-teal-100 px-3 py-1 text-xs font-semibold text-teal-700">
+                  {claimStatusLabel || "Pending"}
+                </span>
+                <span className="rounded-full bg-slate-100 px-3 py-1 text-xs font-semibold text-slate-700">
+                  Authenticity: {claimResult.authenticityScore || 0}%
+                </span>
+              </div>
+            </div>
+
+            <div className="mt-4 grid gap-4 md:grid-cols-3">
+              <div className="rounded-xl border border-slate-200 bg-white p-4">
+                <p className="text-xs uppercase tracking-wide text-slate-500">Overall Score</p>
+                <p className="mt-2 text-3xl font-bold text-teal-700">{claimResult.authenticityScore || 0}%</p>
+              </div>
+              <div className="rounded-xl border border-slate-200 bg-white p-4">
+                <p className="text-xs uppercase tracking-wide text-slate-500">Skills Rating</p>
+                <p className="mt-2 text-3xl font-bold text-slate-800">{(claimResult.skillBreakdown || []).length}</p>
+              </div>
+              <div className="rounded-xl border border-slate-200 bg-white p-4">
+                <p className="text-xs uppercase tracking-wide text-slate-500">Top Match Company</p>
+                <p className="mt-2 text-lg font-bold text-slate-800">{claimResult.shortlist?.[0]?.companyName || "N/A"}</p>
+                <p className="text-xs text-slate-500">{claimResult.shortlist?.[0]?.role || ""}</p>
+              </div>
+            </div>
+
+            <div className="mt-4 grid gap-4 md:grid-cols-2">
+              <div className="rounded-xl border border-slate-200 bg-white p-4">
+                <p className="text-sm font-semibold text-slate-700">Skill Breakdown</p>
+                <div className="mt-3 space-y-2">
+                  {(claimResult.skillBreakdown || []).map((item) => (
+                    <div key={item.skill} className="rounded-lg bg-slate-50 px-3 py-2 text-sm">
+                      <div className="flex items-center justify-between">
+                        <span className="font-medium text-slate-700">{item.skill}</span>
+                        <span className="font-semibold text-slate-800">{item.score}%</span>
+                      </div>
+                      <div className="mt-2 h-2 w-full rounded-full bg-slate-200">
+                        <div
+                          className="h-2 rounded-full bg-teal-500"
+                          style={{ width: `${Math.max(0, Math.min(100, Number(item.score) || 0))}%` }}
+                        />
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+              <div className="rounded-xl border border-slate-200 bg-white p-4">
+                <p className="text-sm font-semibold text-slate-700">Company Shortlist</p>
+                <div className="mt-3 space-y-2">
+                  {(claimResult.shortlist || []).length ? (claimResult.shortlist || []).map((company, rank) => (
+                    <div key={company.companyId} className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+                      <div className="flex items-center justify-between">
+                        <p className="text-sm font-semibold text-slate-800">{company.companyName} - {company.role}</p>
+                        <span className="rounded-full bg-white px-2 py-0.5 text-[11px] font-semibold text-slate-600">
+                          Rank #{rank + 1}
+                        </span>
+                      </div>
+                      <div className="mt-2 grid grid-cols-3 gap-2 text-[11px] text-slate-600">
+                        <span className="rounded bg-white px-2 py-1 text-center font-semibold">Fit {company.fitScore}%</span>
+                        <span className="rounded bg-white px-2 py-1 text-center font-semibold">Test {company.testScore}%</span>
+                        <span className="rounded bg-white px-2 py-1 text-center font-semibold">Coverage {company.claimCoverage}%</span>
+                      </div>
+                    </div>
+                  )) : (
+                    <div className="rounded-lg border border-dashed border-slate-300 bg-slate-50 px-3 py-4 text-sm text-slate-600">
+                      No matching companies found for the current resume skill set.
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+          </motion.div>
+        ) : null}
+
         </div>
       </div>
     </div>
@@ -801,6 +1205,7 @@ function AtsCheckerPage() {
         <WorkspaceSidebar />
         <div className="px-8 py-8">
           <WorkspaceTopbar />
+          <PageExportActions className="mb-4" />
           <div className="glass-panel rounded-2xl p-6">
             <section className="space-y-4">
               <div className="editorial-strip rounded-xl p-5">
@@ -969,7 +1374,6 @@ function WorkspaceTopbar() {
   const navigate = useNavigate();
   const { isDark, toggleTheme } = useContext(ThemeContext);
   const [isDemo, setIsDemo] = useState(isDemoModeActive);
-  const [showExportMenu, setShowExportMenu] = useState(false);
 
   const runTopbarDemo = () => {
     const demo = getDemoAnalysisResult();
@@ -997,35 +1401,10 @@ function WorkspaceTopbar() {
     navigate("/analyze");
   };
 
-  const exportSnapshot = () => {
-    const payload = {
-      exportedAt: new Date().toISOString(),
-      route: window.location.pathname,
-      selectedRole: appState.getSelectedRole() || "Backend Developer",
-      analysisResult: appState.getAnalysisResult(),
-      analysisMeta: appState.getAnalysisMeta(),
-      demoMode: isDemoModeActive(),
-      theme: isDark ? "dark" : "light",
-    };
-    const safeRoute = String(window.location.pathname || "workspace").replace(/\//g, "-").replace(/^-+/, "") || "workspace";
-    exportJsonFile(`resumeiq-${safeRoute}-snapshot.json`, payload);
-    setShowExportMenu(false);
-  };
-
   return (
-    <div className="glass-panel relative mb-6 flex flex-wrap items-center justify-between gap-3 rounded-2xl px-5 py-4">
+    <div className="glass-panel mb-6 flex flex-wrap items-center justify-between gap-3 rounded-2xl px-5 py-4">
       <p className="text-2xl font-bold text-slate-800">ResumeIQ Workspace</p>
       <div className="flex items-center gap-2">
-        <button
-          onClick={() => setShowExportMenu((prev) => !prev)}
-          className={`rounded-full border px-3.5 py-1.5 text-xs font-semibold shadow-sm transition-all ${
-            isDark
-              ? "border-slate-600 bg-slate-800 text-slate-200 hover:bg-slate-700"
-              : "border-slate-300 bg-white text-slate-700 hover:bg-slate-50"
-          }`}
-        >
-          Export
-        </button>
         {isDemo ? (
           <button
             onClick={exitDemoMode}
@@ -1089,25 +1468,42 @@ function WorkspaceTopbar() {
           </span>
         </button>
       </div>
-      {showExportMenu ? (
-        <div className="absolute right-5 top-14 z-30 w-40 rounded-xl border border-slate-200 bg-white p-2 shadow-lg">
-          <button
-            onClick={() => {
-              window.print();
-              setShowExportMenu(false);
-            }}
-            className="w-full rounded-md px-2 py-2 text-left text-sm font-semibold text-slate-700 hover:bg-slate-50"
-          >
-            Print PDF
-          </button>
-          <button
-            onClick={exportSnapshot}
-            className="mt-1 w-full rounded-md px-2 py-2 text-left text-sm font-semibold text-slate-700 hover:bg-slate-50"
-          >
-            Export JSON
-          </button>
-        </div>
-      ) : null}
+    </div>
+  );
+}
+
+function PageExportActions({ className = "" }) {
+  const { isDark } = useContext(ThemeContext);
+  const location = useLocation();
+
+  const exportSnapshot = () => {
+    const payload = {
+      exportedAt: new Date().toISOString(),
+      route: location.pathname,
+      selectedRole: appState.getSelectedRole() || "Backend Developer",
+      analysisResult: appState.getAnalysisResult(),
+      analysisMeta: appState.getAnalysisMeta(),
+      demoMode: isDemoModeActive(),
+      theme: isDark ? "dark" : "light",
+    };
+    const safeRoute = String(location.pathname || "workspace").replace(/\//g, "-").replace(/^-+/, "") || "workspace";
+    exportJsonFile(`resumeiq-${safeRoute}-snapshot.json`, payload);
+  };
+
+  return (
+    <div className={`flex flex-wrap items-center justify-end gap-2 ${className}`}>
+      <button
+        onClick={() => window.print()}
+        className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-50"
+      >
+        Print PDF
+      </button>
+      <button
+        onClick={exportSnapshot}
+        className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-50"
+      >
+        Export JSON
+      </button>
     </div>
   );
 }
@@ -1271,6 +1667,7 @@ function RoleMatchPage() {
         <WorkspaceSidebar />
         <div className="px-8 py-8">
           <WorkspaceTopbar />
+          <PageExportActions className="mb-4" />
           <div className="glass-panel rounded-2xl p-6">
             <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-100 pb-4">
               <div>
@@ -1608,6 +2005,7 @@ function MissingSkillsPage() {
         <WorkspaceSidebar />
         <div className="px-8 py-8">
           <WorkspaceTopbar />
+          <PageExportActions className="mb-4" />
 
           <section className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
             <div className="flex flex-wrap items-center justify-between gap-3">
@@ -1846,6 +2244,7 @@ function IcmScorePage() {
         <WorkspaceSidebar />
         <div className="px-8 py-8">
           <WorkspaceTopbar />
+          <PageExportActions className="mb-4" />
           <div className="glass-panel rounded-2xl p-6">
             <div className="flex flex-wrap items-center justify-between gap-3">
               <div>
@@ -1961,14 +2360,7 @@ function ReportsPage() {
   return (
     <div className="min-h-screen bg-[var(--bg-main)] px-6 py-12">
       <div className="glass-panel mx-auto max-w-6xl rounded-2xl p-8">
-        <div className="mb-4 flex justify-end">
-          <button
-            onClick={() => window.print()}
-            className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-50"
-          >
-            Export
-          </button>
-        </div>
+        <PageExportActions className="mb-4" />
         <h1 className="text-3xl font-bold">Reports</h1>
         <p className="mt-3 text-[var(--muted)]">Recent analysis trend and readiness movement.</p>
         <div className="mt-5 grid gap-4 md:grid-cols-3">
@@ -2039,14 +2431,7 @@ function SettingsPage() {
   return (
     <div className="min-h-screen bg-[var(--bg-main)] px-6 py-12">
       <div className="glass-panel mx-auto max-w-6xl rounded-2xl p-8">
-        <div className="mb-4 flex justify-end">
-          <button
-            onClick={() => window.print()}
-            className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-50"
-          >
-            Export
-          </button>
-        </div>
+        <PageExportActions className="mb-4" />
         <h1 className="text-3xl font-bold">Settings</h1>
         <p className="mt-3 text-[var(--muted)]">Configure workspace defaults and quick controls.</p>
         <div className="mt-5 grid gap-4 md:grid-cols-2">

@@ -6,6 +6,12 @@ const { parseLinkedInLikeProfile } = require("../services/linkedinParser");
 const { analyzeResumeWithAI } = require("../services/openaiService");
 const { computeSkillMatch } = require("../services/skillMatcher");
 const { calculateScore } = require("../utils/scoringUtils");
+const CandidateAssessment = require("../models/CandidateAssessment");
+const {
+  COMPANY_TEMPLATES,
+  createResumeClaimTest,
+  evaluateResumeClaimTest,
+} = require("../services/assessmentService");
 
 const analyzeResume = async (req, res) => {
   try {
@@ -115,7 +121,99 @@ const parseLinkedInProfile = async (req, res) => {
   }
 };
 
+const generateClaimTest = async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: "Resume PDF file is required." });
+    }
+
+    const requestedCompanies = Array.isArray(req.body.companyIds)
+      ? req.body.companyIds
+      : typeof req.body.companyIds === "string"
+        ? req.body.companyIds.split(",").map((item) => item.trim()).filter(Boolean)
+        : [];
+
+    const resumeText = await extractTextFromPdf(req.file.buffer);
+    const test = await createResumeClaimTest({ resumeText, requestedCompanies });
+
+    if (mongoose.connection.readyState === 1) {
+      await CandidateAssessment.findOneAndUpdate(
+        { testId: test.testId },
+        {
+          testId: test.testId,
+          claimedSkills: test.claimedSkills,
+          claimStatus: "pending",
+        },
+        { upsert: true, new: true }
+      );
+    }
+
+    return res.status(200).json({
+      message: "Resume-based claim verification test generated successfully.",
+      availableCompanies: COMPANY_TEMPLATES.map((company) => ({
+        companyId: company.companyId,
+        companyName: company.companyName,
+        role: company.role,
+      })),
+      ...test,
+    });
+  } catch (error) {
+    console.error("Claim test generation failed:", error);
+    return res.status(500).json({
+      error: "Claim test generation failed.",
+      details: error.message,
+    });
+  }
+};
+
+const submitClaimTest = async (req, res) => {
+  try {
+    const testId = String(req.body.testId || "").trim();
+    const answers = Array.isArray(req.body.answers) ? req.body.answers : [];
+    const requestedCompanies = Array.isArray(req.body.companyIds)
+      ? req.body.companyIds
+      : typeof req.body.companyIds === "string"
+        ? req.body.companyIds.split(",").map((item) => item.trim()).filter(Boolean)
+        : [];
+
+    if (!testId) {
+      return res.status(400).json({ error: "testId is required." });
+    }
+
+    const result = evaluateResumeClaimTest({
+      testId,
+      answers,
+      requestedCompanies,
+    });
+
+    if (mongoose.connection.readyState === 1) {
+      await CandidateAssessment.findOneAndUpdate(
+        { testId },
+        {
+          authenticityScore: result.authenticityScore,
+          claimStatus: result.claimStatus,
+          shortlist: result.shortlist,
+        },
+        { upsert: true, new: true }
+      );
+    }
+
+    return res.status(200).json({
+      message: "Claim verification completed. Company shortlist generated.",
+      ...result,
+    });
+  } catch (error) {
+    console.error("Claim test submission failed:", error);
+    return res.status(500).json({
+      error: "Claim test submission failed.",
+      details: error.message,
+    });
+  }
+};
+
 module.exports = {
   analyzeResume,
   parseLinkedInProfile,
+  generateClaimTest,
+  submitClaimTest,
 };
