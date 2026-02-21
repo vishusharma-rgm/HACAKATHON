@@ -814,6 +814,7 @@ function AnalyzePage() {
   const claimResultRef = useRef(null);
   const claimQuestionsRef = useRef(null);
   const resumeUploadRef = useRef(null);
+  const resumeFileInputRef = useRef(null);
   const dragDepthRef = useRef(0);
   const [isDraggingFile, setIsDraggingFile] = useState(false);
   const storedResult = getStoredAnalysisResult();
@@ -852,12 +853,14 @@ function AnalyzePage() {
 
   const handleDropzoneDragEnter = (event) => {
     event.preventDefault();
+    event.stopPropagation();
     dragDepthRef.current += 1;
     setIsDraggingFile(true);
   };
 
   const handleDropzoneDragLeave = (event) => {
     event.preventDefault();
+    event.stopPropagation();
     dragDepthRef.current = Math.max(dragDepthRef.current - 1, 0);
     if (dragDepthRef.current === 0) {
       setIsDraggingFile(false);
@@ -866,6 +869,7 @@ function AnalyzePage() {
 
   const handleDropzoneDrop = (event) => {
     event.preventDefault();
+    event.stopPropagation();
     dragDepthRef.current = 0;
     setIsDraggingFile(false);
     handleResumeFileSelect(event.dataTransfer?.files?.[0] || null);
@@ -1311,11 +1315,22 @@ function AnalyzePage() {
             onDragEnter={handleDropzoneDragEnter}
             onDragOver={(e) => {
               e.preventDefault();
+              e.stopPropagation();
               setIsDraggingFile(true);
             }}
             onDragLeave={handleDropzoneDragLeave}
             onDrop={handleDropzoneDrop}
-            className={`upload-dropzone relative block rounded-xl border-2 border-dashed px-4 py-8 text-center transition-all ${
+            onClick={() => resumeFileInputRef.current?.click()}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                resumeFileInputRef.current?.click();
+              }
+            }}
+            role="button"
+            tabIndex={0}
+            aria-label="Upload resume PDF"
+            className={`upload-dropzone relative block cursor-pointer rounded-xl border-2 border-dashed px-4 py-8 text-center transition-all ${
               isDraggingFile
                 ? "border-teal-500 bg-teal-50"
                 : "border-slate-300 bg-slate-50 hover:border-teal-400 hover:bg-teal-50/60"
@@ -1325,16 +1340,25 @@ function AnalyzePage() {
               <div className="pointer-events-none">
                 <div className="mx-auto mb-2 grid h-10 w-10 place-items-center rounded-full bg-teal-100 text-lg text-teal-700">↑</div>
                 <p className="text-sm font-semibold text-slate-700">Drag & drop resume here</p>
-                <p className="mt-1 text-xs text-slate-500">PDF only</p>
+                <p className="mt-1 text-xs text-slate-500">PDF only. Click to browse.</p>
               </div>
             ) : (
               <div className="pointer-events-none">
                 <div className="mx-auto mb-2 grid h-10 w-10 place-items-center rounded-full bg-slate-100 text-lg text-slate-600">✓</div>
                 <p className="text-sm font-semibold text-slate-800">{fileName}</p>
-                <p className="mt-1 text-xs text-slate-500">Resume uploaded. Drag & drop another PDF to replace.</p>
+                <p className="mt-1 text-xs text-slate-500">Resume uploaded. Drag-drop or click to replace.</p>
               </div>
             )}
           </div>
+          <input
+            ref={resumeFileInputRef}
+            type="file"
+            accept="application/pdf,.pdf"
+            onChange={(e) => handleResumeFileSelect(e.target.files?.[0] || null)}
+            className="hidden"
+            aria-hidden="true"
+            tabIndex={-1}
+          />
           {errorMessage ? <p className="mt-3 text-sm font-medium text-red-600">{errorMessage}</p> : null}
 
           <button
